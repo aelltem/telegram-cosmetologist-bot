@@ -2,9 +2,9 @@ import os
 import json
 import logging
 import random
+import threading
 import http.server
 import socketserver
-import threading
 from datetime import datetime
 
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
@@ -12,177 +12,221 @@ from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    ContextTypes,
-    ConversationHandler,
     filters,
+    ContextTypes,
 )
-from apscheduler.schedulers.background import BackgroundScheduler
-from gtts import gTTS
 from dotenv import load_dotenv
+from gtts import gTTS
+from apscheduler.schedulers.background import BackgroundScheduler
+import httpx
 
-# Загрузка токенов
+# === Загрузка токенов ===
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_MODEL = "openchat/openchat-7b"  # можно изменить
 
-# Основной конфиг
-MASTER_ADMIN_ID = 5104062125
-DATA_FILES = {
-    "admins": "admins.json",
-    "users": "users.json",
-    "settings": "user_settings.json",
-    "profiles": "user_profile.json",
-    "reminders": "reminders.json",
-    "history": "history.json",
-}
-
-# Логгирование
+# === Логгирование ===
 logging.basicConfig(level=logging.INFO)
 
-# ===== УТИЛИТЫ =====
+# === Пути к файлам данных ===
+FILES = {
+    "users": "users.json",
+    "settings": "user_settings.json",
+    "profile": "user_profile.json",
+    "history": "history.json",
+    "reminders": "reminders.json",
+}
 
+# === Инициализация планировщика ===
+scheduler = BackgroundScheduler()
+scheduler.start()
+
+# === Утилиты для JSON ===
 def load_json(name):
     try:
-        with open(DATA_FILES[name], "r", encoding="utf-8") as f:
+        with open(FILES[name], "r", encoding="utf-8") as f:
             return json.load(f)
     except:
         return {}
 
 def save_json(name, data):
-    with open(DATA_FILES[name], "w", encoding="utf-8") as f:
+    with open(FILES[name], "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-def is_admin(user_id):
-    return user_id == MASTER_ADMIN_ID or str(user_id) in load_json("admins")
-
-def add_to_history(user_id, q, a):
-    history = load_json("history")
-    history.setdefault(str(user_id), []).append({
-        "q": q,
-        "a": a,
-        "at": datetime.now().isoformat()
-    })
-    save_json("history", history)
-
-def get_user_settings(user_id):
-    settings = load_json("settings")
-    return settings.get(str(user_id), {"voice": False, "mood": "normal"})
-
-# ====== HANDLERS ======
-
+# === Приветствие ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    user = update.effective_user
     users = load_json("users")
-    users[str(user_id)] = True
+    users[str(user.id)] = user.username or user.first_name
     save_json("users", users)
 
     keyboard = ReplyKeyboardMarkup([
-        ["📆 Напоминание", "🧬 Персонализация"],
-        ["🔍 Анализ состава", "🧠 Настроение"],
-        ["🔊 Формат ответа", "🗃 Моя история"]
+        ["🧴 Помогите выбрать средство"],
+        ["🔍 Анализ состава"],
+        ["📆 Напоминание"],
+        ["💡 Интересный факт"],
+        ["⚙️ Настройки"]
     ], resize_keyboard=True)
 
-    await update.message.reply_text("Привет, я Полина Павловна 🌸 Твой AI-косметолог.", reply_markup=keyboard)
+    greeting = f"Привет, {user.first_name}! Я Полина Павловна 🌸\n" \
+               f"Помогу с уходом за кожей, напомню об уходе, разберу состав косметики и подскажу полезный факт."
 
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    msg = update.message.text
+    await update.message.reply_text(greeting, reply_markup=keyboard)
 
-    if msg == "🧬 Персонализация":
+# === Главное меню ===
+async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    user_id = str(update.effective_user.id)
+
+    if text == "⚙️ Настройки":
+        keyboard = ReplyKeyboardMarkup([
+            ["🎯 Персонализация"],
+            ["🔊 Формат ответа"],
+            ["🧠 Настроение"],
+            ["🗃 Моя история"],
+            ["⬅️ Назад"]
+        ], resize_keyboard=True)
+        await update.message.reply_text("Выберите настройку:", reply_markup=keyboard)
+
+    elif text == "⬅️ Назад":
+        await start(update, context)
+
+    elif text == "🎯 Персонализация":
         await update.message.reply_text("Какой у тебя тип кожи? (сухая / жирная / комбинированная)")
-        return 1
 
-    if msg == "📆 Напоминание":
-        await update.message.reply_text("Напиши в формате: 21:00 нанести ночной крем")
-        return 2
+    elif text == "🔊 Формат ответа":
+        await update.message.reply_text("Выбери формат ответа:", reply_markup=ReplyKeyboardMarkup([
+            ["📝 Текст"], ["🔊 Голос"]
+        ], resize_keyboard=True))
 
-    if msg == "🔍 Анализ состава":
-        await update.message.reply_text("Пришли состав или название продукта для анализа")
-        return 3
+    elif text == "🧠 Настроение":
+        await update.message.reply_text("Как ты себя чувствуешь?", reply_markup=ReplyKeyboardMarkup([
+            ["😄 Хорошо", "😐 Нормально", "😔 Плохо"]
+        ], resize_keyboard=True))
 
-    if msg == "🔊 Формат ответа":
-        await update.message.reply_text("Выбери:", reply_markup=ReplyKeyboardMarkup(
-            [["📝 Текст"], ["🔊 Голос"]], resize_keyboard=True
-        ))
-        return 4
-
-    if msg == "🧠 Настроение":
-        await update.message.reply_text("Как ты себя чувствуешь?", reply_markup=ReplyKeyboardMarkup(
-            [["😄 Хорошо", "😐 Нормально", "😔 Плохо"]], resize_keyboard=True
-        ))
-        return 5
-
-    if msg == "🗃 Моя история":
-        history = load_json("history").get(str(user_id), [])
+    elif text == "🗃 Моя история":
+        history = load_json("history").get(user_id, [])
         if not history:
             await update.message.reply_text("История пока пуста.")
         else:
             reply = "\n\n".join([f"❓ {h['q']}\n💬 {h['a']}" for h in history[-5:]])
             await update.message.reply_text(reply)
 
-async def personalization_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    profiles = load_json("profiles")
-    profiles[str(user_id)] = {"skin": update.message.text}
-    save_json("profiles", profiles)
-    await update.message.reply_text("Запомнила 🌸")
-    return ConversationHandler.END
+    elif text == "💡 Интересный факт":
+        facts = load_json("history").get("facts", [])
+        all_facts = load_json("facts") if os.path.exists("facts.json") else []
+        unused = [f for f in all_facts if f not in facts]
+        if not unused:
+            facts = []
+            unused = all_facts
+        fact = random.choice(unused)
+        facts.append(fact)
+        h = load_json("history")
+        h["facts"] = facts
+        save_json("history", h)
+        await update.message.reply_text(f"💡 Факт: {fact}")
 
-async def reminder_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    time_text = update.message.text
-    try:
-        t, note = time_text.split(" ", 1)
-        hour, minute = map(int, t.split(":"))
-        scheduler.add_job(
-            lambda: context.bot.send_message(chat_id=user_id, text=f"🔔 Напоминание: {note}"),
-            trigger="cron", hour=hour, minute=minute, id=f"{user_id}_{note}"
-        )
-        await update.message.reply_text("Напоминание установлено ✅")
-    except:
-        await update.message.reply_text("Неверный формат. Пример: 21:00 нанести крем.")
-    return ConversationHandler.END
+    elif text == "📆 Напоминание":
+        await update.message.reply_text("Напиши напоминание в формате:\n21:00 нанести крем")
 
-async def analyze_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    query = update.message.text
-    # Эмуляция анализа
-    result = f"🧪 Анализ:\n\n{query}\n\n🌿 Это средство может быть полезным, если не содержит спирта."
-    add_to_history(user_id, query, result)
+    elif text == "🔍 Анализ состава":
+        await update.message.reply_text("Введи название средства или состав — я разберу!")
 
-    settings = get_user_settings(user_id)
+    elif text == "🧴 Помогите выбрать средство":
+        await update.message.reply_text("Напиши тип проблемы (например, акне, сухость, чувствительная кожа).")
+
+    elif ":" in text and len(text) >= 8:  # Анализ состава или напоминание
+        if text[:5].isdigit():
+            # Напоминание
+            hour, minute = map(int, text[:5].split(":"))
+            note = text[6:]
+            reminders = load_json("reminders")
+            reminders.setdefault(user_id, []).append({"time": f"{hour:02}:{minute:02}", "text": note})
+            save_json("reminders", reminders)
+            await update.message.reply_text("Напоминание сохранено ✅")
+        else:
+            # Анализ
+            result = await analyze_ingredients(text)
+            await send_response(update, context, user_id, text, result)
+
+    elif text in ["сухая", "жирная", "комбинированная"]:
+        profiles = load_json("profile")
+        profiles[user_id] = {"skin": text}
+        save_json("profile", profiles)
+        await update.message.reply_text("Запомнила тип кожи 💖")
+
+    elif text in ["📝 Текст", "🔊 Голос"]:
+        settings = load_json("settings")
+        settings[user_id] = settings.get(user_id, {})
+        settings[user_id]["voice"] = True if "Голос" in text else False
+        save_json("settings", settings)
+        await update.message.reply_text("Формат ответа сохранён 🎙")
+
+    elif text in ["😄 Хорошо", "😐 Нормально", "😔 Плохо"]:
+        mood = "good" if "Хорошо" in text else "bad" if "Плохо" in text else "normal"
+        settings = load_json("settings")
+        settings[user_id] = settings.get(user_id, {})
+        settings[user_id]["mood"] = mood
+        save_json("settings", settings)
+        await update.message.reply_text("Настроение учтено ❤️")
+
+# === Ответ от AI и TTS ===
+async def send_response(update, context, user_id, query, answer):
+    settings = load_json("settings").get(user_id, {})
+    add_to_history(user_id, query, answer)
+
     if settings.get("voice"):
-        tts = gTTS(result, lang="ru")
-        audio_file = f"/tmp/{user_id}_voice.ogg"
-        tts.save(audio_file)
-        with open(audio_file, "rb") as f:
+        tts = gTTS(answer, lang="ru")
+        file = f"/tmp/{user_id}_resp.ogg"
+        tts.save(file)
+        with open(file, "rb") as f:
             await update.message.reply_voice(voice=f)
     else:
-        await update.message.reply_text(result)
-    return ConversationHandler.END
+        await update.message.reply_text(answer)
 
-async def voice_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    choice = update.message.text
-    settings = load_json("settings")
-    settings[str(user_id)] = settings.get(str(user_id), {})
-    settings[str(user_id)]["voice"] = True if "Голос" in choice else False
-    save_json("settings", settings)
-    await update.message.reply_text("Настройка сохранена ✅")
-    return ConversationHandler.END
+# === История ===
+def add_to_history(user_id, q, a):
+    hist = load_json("history")
+    hist.setdefault(str(user_id), []).append({
+        "q": q, "a": a, "at": datetime.now().isoformat()
+    })
+    save_json("history", hist)
 
-async def mood_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    mood = "good" if "Хорошо" in update.message.text else "bad" if "Плохо" in update.message.text else "normal"
-    settings = load_json("settings")
-    settings[str(user_id)] = settings.get(str(user_id), {})
-    settings[str(user_id)]["mood"] = mood
-    save_json("settings", settings)
-    await update.message.reply_text("Учту это в своих ответах 🧠")
-    return ConversationHandler.END
+# === Анализ состава через OpenRouter ===
+async def analyze_ingredients(text):
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "HTTP-Referer": "https://t.me/polina_pavlovna_bot",
+        "X-Title": "Cosmetologist Bot"
+    }
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {"role": "system", "content": "Ты косметолог. Разбери состав косметического средства, объясни, какие компоненты полезны, а какие могут навредить."},
+            {"role": "user", "content": text}
+        ]
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
+            return resp.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        return f"Ошибка анализа: {e}"
 
-# ===== СЕРВЕР ДЛЯ RENDER =====
+# === Планировщик (интервальный) ===
+def check_reminders(bot):
+    now = datetime.now().strftime("%H:%M")
+    reminders = load_json("reminders")
+    for uid, entries in reminders.items():
+        for item in entries:
+            if item["time"] == now:
+                try:
+                    bot.send_message(chat_id=int(uid), text=f"🔔 Напоминание: {item['text']}")
+                except:
+                    pass
 
+# === Пустой сервер для Render ===
 def run_dummy_server():
     PORT = int(os.environ.get("PORT", 10000))
     Handler = http.server.SimpleHTTPRequestHandler
@@ -190,32 +234,18 @@ def run_dummy_server():
         print(f"Serving dummy server at port {PORT}")
         httpd.serve_forever()
 
-# ===== ОСНОВНОЙ ЗАПУСК =====
-
+# === Запуск бота ===
 def main():
-    global scheduler
-    scheduler = BackgroundScheduler()
-    scheduler.start()
-
+    scheduler.add_job(lambda: check_reminders(bot), "interval", minutes=1)
     app = Application.builder().token(TOKEN).build()
+    global bot
+    bot = app.bot
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
 
-    app.add_handler(ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT, text_handler)],
-        states={
-            1: [MessageHandler(filters.TEXT, personalization_step)],
-            2: [MessageHandler(filters.TEXT, reminder_step)],
-            3: [MessageHandler(filters.TEXT, analyze_step)],
-            4: [MessageHandler(filters.TEXT, voice_setting)],
-            5: [MessageHandler(filters.TEXT, mood_setting)],
-        },
-        fallbacks=[]
-    ))
-
+    threading.Thread(target=run_dummy_server, daemon=True).start()
     app.run_polling()
 
-# 🔥 Запуск порта + бота
-threading.Thread(target=run_dummy_server, daemon=True).start()
-main()
+if __name__ == "__main__":
+    main()
