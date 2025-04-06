@@ -7,7 +7,7 @@ import http.server
 import socketserver
 from datetime import datetime
 
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -20,16 +20,19 @@ from gtts import gTTS
 from apscheduler.schedulers.background import BackgroundScheduler
 import httpx
 
+# === Импорт фактов ===
+from facts import INTERESTING_FACTS
+
 # === Загрузка токенов ===
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-OPENROUTER_MODEL = "openchat/openchat-7b"  # можно изменить
+OPENROUTER_MODEL = "openchat/openchat-7b"
 
 # === Логгирование ===
 logging.basicConfig(level=logging.INFO)
 
-# === Пути к файлам данных ===
+# === Пути к JSON-файлам ===
 FILES = {
     "users": "users.json",
     "settings": "user_settings.json",
@@ -38,11 +41,11 @@ FILES = {
     "reminders": "reminders.json",
 }
 
-# === Инициализация планировщика ===
+# === Планировщик ===
 scheduler = BackgroundScheduler()
 scheduler.start()
 
-# === Утилиты для JSON ===
+# === JSON Утилиты ===
 def load_json(name):
     try:
         with open(FILES[name], "r", encoding="utf-8") as f:
@@ -114,17 +117,16 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(reply)
 
     elif text == "💡 Интересный факт":
-        facts = load_json("history").get("facts", [])
-        all_facts = load_json("facts") if os.path.exists("facts.json") else []
-        unused = [f for f in all_facts if f not in facts]
+        history = load_json("history")
+        shown = history.get("facts", [])
+        unused = [fact for fact in INTERESTING_FACTS if fact not in shown]
         if not unused:
-            facts = []
-            unused = all_facts
+            shown = []
+            unused = INTERESTING_FACTS
         fact = random.choice(unused)
-        facts.append(fact)
-        h = load_json("history")
-        h["facts"] = facts
-        save_json("history", h)
+        shown.append(fact)
+        history["facts"] = shown
+        save_json("history", history)
         await update.message.reply_text(f"💡 Факт: {fact}")
 
     elif text == "📆 Напоминание":
@@ -136,9 +138,8 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "🧴 Помогите выбрать средство":
         await update.message.reply_text("Напиши тип проблемы (например, акне, сухость, чувствительная кожа).")
 
-    elif ":" in text and len(text) >= 8:  # Анализ состава или напоминание
+    elif ":" in text and len(text) >= 8:
         if text[:5].isdigit():
-            # Напоминание
             hour, minute = map(int, text[:5].split(":"))
             note = text[6:]
             reminders = load_json("reminders")
@@ -146,7 +147,6 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_json("reminders", reminders)
             await update.message.reply_text("Напоминание сохранено ✅")
         else:
-            # Анализ
             result = await analyze_ingredients(text)
             await send_response(update, context, user_id, text, result)
 
@@ -214,7 +214,7 @@ async def analyze_ingredients(text):
     except Exception as e:
         return f"Ошибка анализа: {e}"
 
-# === Планировщик (интервальный) ===
+# === Планировщик уведомлений ===
 def check_reminders(bot):
     now = datetime.now().strftime("%H:%M")
     reminders = load_json("reminders")
@@ -226,7 +226,7 @@ def check_reminders(bot):
                 except:
                     pass
 
-# === Пустой сервер для Render ===
+# === Dummy-сервер для Render ===
 def run_dummy_server():
     PORT = int(os.environ.get("PORT", 10000))
     Handler = http.server.SimpleHTTPRequestHandler
@@ -234,7 +234,7 @@ def run_dummy_server():
         print(f"Serving dummy server at port {PORT}")
         httpd.serve_forever()
 
-# === Запуск бота ===
+# === Запуск ===
 def main():
     scheduler.add_job(lambda: check_reminders(bot), "interval", minutes=1)
     app = Application.builder().token(TOKEN).build()
